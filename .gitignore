@@ -157,6 +157,10 @@ ENV/
 env.bak/
 venv.bak/
 
+/models
+
+/GPT4All.app
+
 # Spyder project settings
 .spyderproject
 .spyproject
