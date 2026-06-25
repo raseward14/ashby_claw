@@ -41,6 +41,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 LLMS_TXT_URL = "https://developers.ashbyhq.com/llms.txt"
+ASHBY_API_BASE = "https://api.ashbyhq.com"
 CACHE_DIR = Path(".cache") / "ashby_docs"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_CACHE_PATH = CACHE_DIR / "llms_index.json"
@@ -273,8 +274,9 @@ def build_answer_prompt(question: str, docs: list[dict[str, str]]) -> tuple[str,
     system = (
         "You are an Ashby API assistant. Use only the Ashby docs text provided. "
         "Answer with: Yes/No (if applicable), the endpoint name, HTTP method, "
-        "URL, and required body params. Do not invent fields that aren't in "
-        "the provided docs. Do not add unrelated explanation."
+        "URL, required body params, and optional body params — list these "
+        "two groups separately and label them clearly. Do not invent fields "
+        "that aren't in the provided docs. Do not add unrelated explanation."
     )
 
     parts = []
@@ -284,10 +286,10 @@ def build_answer_prompt(question: str, docs: list[dict[str, str]]) -> tuple[str,
     return system, user
 
 
-def answer_question(model, index: list[dict[str, str]], question: str) -> str:
+def answer_question(model, index: list[dict[str, str]], question: str) -> tuple[str, list[dict[str, str]]]:
     selected = select_relevant_endpoints(model, question, index)
     if not selected:
-        return "No matching Ashby endpoint found in the docs index for that question."
+        return "No matching Ashby endpoint found in the docs index for that question.", []
 
     print("\nSelected Ashby endpoints:")
     for item in selected:
@@ -302,7 +304,134 @@ def answer_question(model, index: list[dict[str, str]], question: str) -> str:
         docs.append({"url": item["url"], "text": text})
 
     system, user = build_answer_prompt(question, docs)
-    return model.complete(system, user)
+    answer = model.complete(system, user)
+    return answer, docs
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Optionally build and send a real Ashby API request
+# ---------------------------------------------------------------------------
+#
+# Everything above this point is read-only (fetching docs, asking the LLM
+# questions about them). This section is different: it can make a real,
+# authenticated POST request against your live Ashby workspace, which can
+# create/modify real data. Because of that:
+#   - The LLM only ever PROPOSES a request (as strict JSON). It never sends
+#     anything itself — sending is a separate, explicit step.
+#   - send_ashby_request() always requires the caller to have already
+#     confirmed; there's no auto-send path anywhere in this file.
+#   - The REPL below always prints the proposed request and asks for an
+#     explicit "y" before calling send_ashby_request().
+
+def build_request_prompt(question: str, docs: list[dict[str, str]]) -> tuple[str, str]:
+    system = (
+        "You convert a user's request into a single Ashby API call, using "
+        "only the documentation provided. Respond with ONLY a JSON object "
+        "with keys: \"method\" (HTTP verb, almost always \"POST\" for Ashby), "
+        "\"path\" (e.g. \"/candidate.addTag\"), \"body\" (a JSON object of "
+        "request parameters the user's request implies, using exact field "
+        "names from the docs), and \"optional_available\" (a JSON object "
+        "mapping the name of every OTHER optional field the endpoint "
+        "supports, that you did NOT include in body, to a short description "
+        "of what it does). Do not invent fields that aren't in the docs. If "
+        "required information is missing from the question, leave that "
+        "field's value in body as the literal string \"FILL_ME_IN\" rather "
+        "than guessing. No prose, no markdown fences, JSON only."
+    )
+    parts = []
+    for i, doc in enumerate(docs, start=1):
+        parts.append(f"[Document {i}] {doc['url']}\n{doc['text'][:DOC_CHAR_LIMIT]}\n---")
+    user = "\n".join(parts) + f"\n\nUser request: {question}\nJSON:"
+    return system, user
+
+
+def build_request_spec(model, question: str, docs: list[dict[str, str]]) -> dict | None:
+    """Ask the LLM to propose a {method, path, body} spec. Returns None on failure."""
+    system, user = build_request_prompt(question, docs)
+    raw = model.complete(system, user).strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(spec, dict) or "path" not in spec:
+        return None
+    spec.setdefault("method", "POST")
+    spec.setdefault("body", {})
+    spec.setdefault("optional_available", {})
+    return spec
+
+
+def spec_has_unfilled_fields(spec: dict) -> list[str]:
+    """Returns a list of body keys the LLM couldn't fill from the question/docs."""
+    body = spec.get("body", {})
+    if not isinstance(body, dict):
+        return []
+    return [k for k, v in body.items() if v == "FILL_ME_IN"]
+
+
+def print_proposed_request(spec: dict) -> None:
+    print(f"\nProposed request:\n  {spec.get('method', 'POST')} {spec.get('path')}")
+    print(f"  body: {json.dumps(spec.get('body', {}), indent=2)}")
+    optional_available = spec.get("optional_available", {})
+    if optional_available:
+        print("\n  Other optional fields this endpoint supports (not included above):")
+        for field, desc in optional_available.items():
+            print(f"   - {field}: {desc}")
+
+
+def collect_missing_fields(spec: dict) -> dict:
+    """
+    Prompts the user, by name, for every body field still marked FILL_ME_IN
+    and returns a patched copy of spec with those values filled in. The user
+    can type 'skip' to leave a field blank, or 'cancel' to abort entirely
+    (returns None in that case).
+    """
+    missing = spec_has_unfilled_fields(spec)
+    if not missing:
+        return spec
+
+    print(f"\nClaw needs values for: {', '.join(missing)}")
+    print("(type 'skip' to leave a field out, or 'cancel' to abandon this request)")
+    body = dict(spec.get("body", {}))
+    for field in missing:
+        value = input(f"  {field}: ").strip()
+        if value.lower() == "cancel":
+            return None
+        if value.lower() == "skip":
+            del body[field]
+            continue
+        body[field] = value
+
+    patched = dict(spec)
+    patched["body"] = body
+    return patched
+
+
+def send_ashby_request(spec: dict, api_key: str) -> dict:
+    """
+    Actually sends the request to Ashby. Caller is responsible for having
+    confirmed with the user first — this function does not prompt.
+    """
+    url = ASHBY_API_BASE.rstrip("/") + "/" + spec["path"].lstrip("/")
+    method = spec.get("method", "POST").upper()
+    body = spec.get("body", {})
+
+    resp = requests.request(
+        method,
+        url,
+        json=body,
+        auth=(api_key, ""),  # Basic auth: API key as username, blank password
+        headers={"Content-Type": "application/json", "Accept": "application/json; version=1"},
+        timeout=15,
+    )
+
+    result = {"status_code": resp.status_code, "url": url}
+    try:
+        result["json"] = resp.json()
+    except ValueError:
+        result["text"] = resp.text
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +452,13 @@ def main() -> None:
 
     model = LocalModelBackend() if args.local else GitHubModelsBackend()
     index = fetch_llms_index(force_refresh=args.refresh_index)
+    ashby_api_key = os.environ.get("ASHBY_API_KEY")
 
     print("Ashby ATS Claw Console Initialized.")
     print(f"Loaded {len(index)} endpoints from Ashby's docs index.")
-    print("Hi! I'm Lisa, your Ashby API consultant. Type your request below (or type 'quit' to exit):")
+    if not ashby_api_key:
+        print("(No ASHBY_API_KEY set — Claw can still answer questions, but can't send live requests.)")
+    print("Type your request below (or type 'quit' to exit):")
     print("-" * 50)
 
     while True:
@@ -338,10 +470,50 @@ def main() -> None:
 
         print("\nClaw thinking...")
         try:
-            answer = answer_question(model, index, user_input)
+            answer, docs = answer_question(model, index, user_input)
             print(f"\nClaw: {answer}")
         except Exception as e:
             print(f"\nError: {e}")
+            continue
+
+        if not docs or not ashby_api_key:
+            continue
+
+        do_send = input("\nWould you like Claw to send this as a live Ashby API request? (y/n): ").strip().lower()
+        if do_send != "y":
+            continue
+
+        try:
+            spec = build_request_spec(model, user_input, docs)
+        except Exception as e:
+            print(f"\nError building request: {e}")
+            continue
+
+        if spec is None:
+            print("\nCouldn't build a clean request from that — try rephrasing with more specifics.")
+            continue
+
+        print_proposed_request(spec)
+
+        if spec_has_unfilled_fields(spec):
+            spec = collect_missing_fields(spec)
+            if spec is None:
+                print("Cancelled.")
+                continue
+            print("\nUpdated request:")
+            print_proposed_request(spec)
+
+        confirm = input("\nSend this request to your live Ashby workspace? (y/n): ").strip().lower()
+        if confirm != "y":
+            print("Cancelled.")
+            continue
+
+        try:
+            result = send_ashby_request(spec, ashby_api_key)
+            print(f"\nClaw: Sent. Status {result['status_code']}.")
+            print(json.dumps(result.get("json", result.get("text")), indent=2))
+        except Exception as e:
+            print(f"\nError sending request: {e}")
 
 
 if __name__ == "__main__":

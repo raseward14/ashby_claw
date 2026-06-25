@@ -24,6 +24,7 @@ cd ashby_claw
 1. Log in to your Ashby admin account.
 2. Go to **Admin → API Keys**.
 3. Create a new API key and copy it — you'll need it for `.env` below.
+4. By default, a new key has **no permissions**. Check the boxes for whichever modules you want Lisa to be able to read or write (e.g. Candidates, Applications) — otherwise live requests will fail with a `missing_endpoint_permission` error even with a valid key.
 
 ### 3. Create a GitHub PAT with Models access
 
@@ -90,4 +91,35 @@ You: What fields are required to submit interview feedback?
 You: How do I cancel an interview schedule?
 ```
 
+### Sending live requests
+
+If `ASHBY_API_KEY` is set, Lisa can also turn a question into a real API call against your Ashby workspace — after showing you the exact request and asking for confirmation before anything is sent:
+
+```
+You: Add the tag "strong-candidate" to candidate ID abc123
+Claw: [answers the question, then asks] Would you like Claw to send this as a live Ashby API request? (y/n)
+```
+
+Lisa will refuse to send anything if required fields (like an ID she can't infer from your question) are missing — she'll tell you what's needed so you can rephrase and try again. Nothing is ever sent without an explicit "y" confirmation.
+
 Type `quit` or `exit` to end the session.
+
+## Commands
+
+Run Lisa:
+
+```bash
+python3 claw.py
+```
+
+Run Lisa (uses local LLM):
+
+```bash
+python3 claw.py --local
+```
+
+Forces a fresh pull, refreshing cache:
+
+```bash
+python3 claw.py --refresh-index
+```
