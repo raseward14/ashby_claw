@@ -326,7 +326,7 @@ def main() -> None:
 
     print("Ashby ATS Claw Console Initialized.")
     print(f"Loaded {len(index)} endpoints from Ashby's docs index.")
-    print("Type your request below (or type 'quit' to exit):")
+    print("Hi! I'm Lisa, your Ashby API consultant. Type your request below (or type 'quit' to exit):")
     print("-" * 50)
 
     while True:
