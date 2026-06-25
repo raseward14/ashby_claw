@@ -2,6 +2,8 @@
 
 Meet Lisa, my personal Ashby API consultant. She answers questions, sends requests, and troubleshoots errors. Uses Microsoft Agent Framework.
 
+•[Ashby Docs For AI agents](https://developers.ashbyhq.com/llms.txt)
+
 •[Meet your agent harness and claw](https://devblogs.microsoft.com/agent-framework/meet-your-agent-harness-and-claw/)
 
 •[Ashby Knowledge Base](https://docs.ashbyhq.com/)
